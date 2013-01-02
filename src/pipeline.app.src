@@ -1,0 +1,10 @@
+%% -*- mode: erlang -*-
+
+{application, pipeline,
+ [
+  {description, "Pipeline"},
+  {vsn, "0.0.1"},
+  {registered, []},
+  {applications, [kernel, stdlib, sasl]}
+ ]
+}.
