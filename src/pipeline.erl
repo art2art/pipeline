@@ -90,12 +90,12 @@ ch({Pid,    _Opts}) when is_pid(Pid)       -> ok;
 ch({Module, _Opts}) when is_atom(Module)   -> ok;
 ch({Module, Fun, _Opts}) when is_atom(Module),
                               is_atom(Fun) -> ok;
-ch(_Other) -> throw(bad_spec).
+ch(Other) -> throw({bad_spec, Other}).
 
 -spec check_specs(Specs :: [pipe_spec()]) -> 'ok' | 'bad_spec'.
 check_specs(Specs) ->
     case catch ([ch(S)|| S <- Specs]) of
-        bad_spec -> bad_spec;
+        {bad_spec, _} = Bad -> Bad;
         _Other   -> ok
     end.
 
@@ -109,12 +109,12 @@ build_acts(Specs) ->
             false -> Fun(Args)
         end).
 
--spec exec(Fun :: pipe_fun(), Args :: term()) -> term().
+-spec exec(Fun :: pipe_fun(), Args :: [term()]) -> [term()].
 exec(Fun, Args) ->
     case ?EXEC(Fun, Args) of
         {error, Reason} ->
             report_error(Reason),
-            exit(kill);
+            exit(shutdown_pipeline);
         NextArgs when is_list(NextArgs) ->
             NextArgs;
         NextArgs ->
@@ -198,9 +198,12 @@ perform_port(Port, _Msg, _Timeout) ->           % TODO: should consider, must be
     end.
 
 handle_result(_Msg,             ignore)  -> [];
-handle_result({'EXIT', Reason}, _Ignore) -> {error, Reason};
+handle_result({ok, Result},     _Ignore) -> Result;
 handle_result({error, Reason},  _Ignore) -> {error, Reason};
-handle_result({ok, Result},     _Ignore) -> Result.
+handle_result({'EXIT', Reason}, _Ignore) -> {error, Reason};
+%% handle_result({'EXIT', _Pid, Reason}, _Ignore) -> {error, Reason};
+%% handle_result({'DOWN', _Ref, _, _Pid, Reason}, _Ignore) -> {error, Reason};
+handle_result(Msg,              _Ignore) -> Msg.
 
 report_error(Reason) ->
     error_logger:error_report(pipeline, [{pid, self()}, {reason, Reason}]).
@@ -226,9 +229,9 @@ getval(Key, List, Default) ->
 -include_lib("eunit/include/eunit.hrl").
 
 pipeline_test() ->
-    F1 = fun()    -> {ok,    [<<"Hello_1 ">>]} end,
-    F2 = fun(Msg) -> {error, Msg}              end,
-    F3 = fun()    -> {ok,    [<<"Done">>]}     end,
+    F1 = fun()    -> {ok,    <<"Hello_1 ">>} end,
+    F2 = fun(Msg) -> {error, Msg}            end,
+    F3 = fun()    -> {ok,    [<<"Done">>]}   end,
     F4 = fun(Msg1, Msg2) -> {ok, list_to_binary(Msg1 ++ Msg2)} end,
     Spec = [
             {F1, []},
