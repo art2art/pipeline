@@ -4,7 +4,7 @@
 -behaviour(gen_server).
 
 -export([start_link/1, start_link/2]).
--export([go/1, go/2]).
+-export([go/1, go/2, test/0]).
 
 -export([init/1,
          handle_call/3,
@@ -16,10 +16,14 @@
 -type pipe_out()  :: {ok, term()} | {error, term()}.
 -type pipe_fun()  :: fun(() -> pipe_out())
                    | fun((Args :: term()) -> pipe_out()).
--type pipe_name() :: {'local', Name :: atom()}
+-type pipe_name() :: pid()
+                   | atom()
+                   | {'local', Name :: atom()}
                    | {'global', Name :: atom()}.
 -type pipe_opt()  :: {'timeout', Timeout :: timeout()}
                    | {'args', Args :: [term()]}
+                   | {'args_r', Args :: [term()]}
+                   | {'args_l', Args :: [term()]}
                    | 'ignore'.
 -type pipe_opts() :: [pipe_opt()].
 -type pipe_spec() :: {Module :: atom(), Function :: atom(), Opts :: pipe_opts()}
@@ -35,40 +39,47 @@
 
 -spec start_link(PipeName, Specs) -> {'ok', pid()} when
       PipeName :: pipe_name(),
-      Specs    :: [pipe_spec()].
+      Specs :: [pipe_spec()].
 start_link(PipeName, Specs) ->
     gen_server:start_link(PipeName, ?MODULE, Specs, []).
 
--spec start_link(Specs  :: [pipe_spec()]) -> {'ok', pid()}.
+-spec start_link(Specs :: [pipe_spec()]) -> {'ok', pid()}.
 start_link(Specs) ->
     gen_server:start_link(?MODULE, Specs, []).
 
 -spec go(RefPipe) -> {'ok', term()} | {'error', Reason} when
       RefPipe :: pipe_name(),
-      Reason  :: term().
+      Reason :: term().
 go(RefPipe) ->
     gen_server:call(RefPipe, exec).
 
 -spec go(RefPipe, Initial) -> {'ok', term()} | {'error', Reason} when
       RefPipe :: pipe_name(),
       Initial :: term(),
-      Reason  :: term().
+      Reason :: term().
 go(RefPipe, Arg) ->
     gen_server:call(RefPipe, {exec, Arg}).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 init(Specs) ->
-    erlang:process_flag(trap_exit, true),
+    %% erlang:process_flag(trap_exit, true),
     timer:apply_after(0, gen_server, cast, [self(), {init, Specs}]),
     {ok, #state{}}.
 
-handle_call(exec, _From, State) ->
-    Result = lists:foldl(fun exec/2, undefined, State#state.acts),
-    {reply, {ok, Result}, State, 0};
+handle_call(exec, From, State) ->
+    handle_call({exec, []}, From, State);
 handle_call({exec, Initial}, _From, State) ->
-    Result = lists:foldl(fun exec/2, Initial, State#state.acts),
-    {reply, {ok, Result}, State, 0}.
+    case exec(State#state.acts, Initial) of
+        {error, _, _} = Error ->
+            {stop, brutal_kill, Error, State};
+        [] ->
+            {stop, shutdown, ok, State};
+        {ok, _} = Result0 ->
+            {stop, shutdown, Result0, State};
+        Result1 ->
+            {stop, shutdown, {ok, Result1}, State}
+    end.
 
 handle_cast({init, Specs}, State) ->
     ok = check_specs(Specs),
@@ -84,42 +95,57 @@ terminate(_Reason, _State) ->
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
--spec ch(Spec :: pipe_spec()) -> 'ok' | 'bad_spec'.
-ch({Fun,    _Opts}) when is_function(Fun)  -> ok;
-ch({Pid,    _Opts}) when is_pid(Pid)       -> ok;
-ch({Module, _Opts}) when is_atom(Module)   -> ok;
-ch({Module, Fun, _Opts}) when is_atom(Module),
-                              is_atom(Fun) -> ok;
+-define(EXECUTE(Fun, Arg),
+        case is_function(Fun, 0) of
+            true  -> Fun();
+            false -> Fun(Args)
+        end).
+
+-spec exec(Funs :: [pipe_fun()], Args :: [term()]) -> term() | {error, term()}.
+exec([], Result) ->
+    Result;
+exec([Fun | Rest], Args) ->
+    case ?EXECUTE(Fun, Args) of
+        {error, Reason} ->
+            report_error(Reason),
+            {error, Reason, {Args, Rest}};
+        Result when is_list(Result) ->
+            exec(Rest, Result);
+        Result ->
+            exec(Rest, [Result])
+    end.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+-spec chopts(Opts :: [term()]) -> 'ok' | {'bad_spec', Bad :: any()}.
+chopts(Opts) when is_list(Opts) ->
+    lists:foreach(fun cho/1, Opts).
+
+cho({timeout, _}) -> ok;
+cho({args,    _}) -> ok;
+cho({args_r,  _}) -> ok;
+cho({args_l,  _}) -> ok;
+cho(ignore      ) -> ok;
+cho(Other       ) -> throw({bad_spec, Other}).
+
+
+-spec ch(Spec :: pipe_spec()) -> 'ok' | {'bad_spec', Bad :: any()}.
+ch({Fun,    Opts}) when is_function(Fun)  -> chopts(Opts);
+ch({Pid,    Opts}) when is_pid(Pid)       -> chopts(Opts);
+ch({Module, Opts}) when is_atom(Module)   -> chopts(Opts);
+ch({Module, Fun, Opts}) when is_atom(Module), is_atom(Fun) -> chopts(Opts);
 ch(Other) -> throw({bad_spec, Other}).
 
 -spec check_specs(Specs :: [pipe_spec()]) -> 'ok' | 'bad_spec'.
 check_specs(Specs) ->
     case catch ([ch(S)|| S <- Specs]) of
         {bad_spec, _} = Bad -> Bad;
-        _Other   -> ok
+        _Other              -> ok
     end.
 
 -spec build_acts(Specs :: [pipe_spec()]) -> [pipe_fun()].
 build_acts(Specs) ->
     [build_act(S) || S <- Specs].
-
--define(EXEC(Fun, Arg),
-        case is_function(Fun, 0) of
-            true  -> Fun();
-            false -> Fun(Args)
-        end).
-
--spec exec(Fun :: pipe_fun(), Args :: [term()]) -> [term()].
-exec(Fun, Args) ->
-    case ?EXEC(Fun, Args) of
-        {error, Reason} ->
-            report_error(Reason),
-            exit(shutdown_pipeline);
-        NextArgs when is_list(NextArgs) ->
-            NextArgs;
-        NextArgs ->
-            NextArgs
-    end.
 
 build_act({Fun, Opts}) when is_function(Fun) ->
     suit_fun(getval(args, Opts, undefined),
@@ -155,7 +181,7 @@ suit_fun(undefined, Ignore, Type) ->
         {Port, Timeout} when is_port(Port) ->
             fun(Args) -> ?HR(perform_port(Port, Args, Timeout), Ignore) end
     end;
-suit_fun(Args, Ignore, Type) ->
+suit_fun({args, Args}, Ignore, Type) ->
     case Type of
         Fun when is_function(Fun) ->
             fun() -> ?HR(perform_fun(Fun, Args), Ignore) end;
@@ -165,6 +191,28 @@ suit_fun(Args, Ignore, Type) ->
             fun() -> ?HR(perform_pid(Pid, Args, Timeout), Ignore) end;
         {Port, Timeout} when is_port(Port) ->
             fun() -> ?HR(perform_port(Port, Args, Timeout), Ignore) end
+    end;
+suit_fun({args_l, SetArgs}, Ignore, Type) ->
+    case Type of
+        Fun when is_function(Fun) ->
+            fun(InArgs) -> ?HR(perform_fun(Fun, SetArgs ++ InArgs), Ignore) end;
+        {Mod, Fun} when is_atom(Mod), is_atom(Fun) ->
+            fun(InArgs) -> ?HR(perform_mfa(Mod, Fun, SetArgs ++ InArgs), Ignore) end;
+        {Pid, Timeout} when is_pid(Pid) ->
+            fun(InArgs) -> ?HR(perform_pid(Pid, SetArgs ++ InArgs, Timeout), Ignore) end;
+        {Port, Timeout} when is_port(Port) ->
+            fun(InArgs) -> ?HR(perform_port(Port, SetArgs ++ InArgs, Timeout), Ignore) end
+    end;
+suit_fun({args_r, SetArgs}, Ignore, Type) ->
+    case Type of
+        Fun when is_function(Fun) ->
+            fun(InArgs) -> ?HR(perform_fun(Fun, InArgs ++ SetArgs), Ignore) end;
+        {Mod, Fun} when is_atom(Mod), is_atom(Fun) ->
+            fun(InArgs) -> ?HR(perform_mfa(Mod, Fun, InArgs ++ SetArgs), Ignore) end;
+        {Pid, Timeout} when is_pid(Pid) ->
+            fun(InArgs) -> ?HR(perform_pid(Pid, InArgs ++ SetArgs, Timeout), Ignore) end;
+        {Port, Timeout} when is_port(Port) ->
+            fun(InArgs) -> ?HR(perform_port(Port, InArgs ++ SetArgs, Timeout), Ignore) end
     end.
 
 perform_fun(Fun, Args) ->
@@ -174,8 +222,7 @@ perform_mfa(Mod, Fun, Args) ->
 perform_pid(Pid, Msg, Timeout) ->               % TODO: should consider, must be completed.
     case erlang:is_process_alive(Pid) of
         false ->
-            {error, {Pid, is_dead}};
-        true ->
+            {error, {Pid, is_dead}};        true ->
             Ref = erlang:monitor(Pid),
             erlang:send(Pid, Msg),
             Rec = receive
@@ -194,20 +241,31 @@ perform_port(Port, _Msg, _Timeout) ->           % TODO: should consider, must be
         'undefined' ->
             {error, {Port, is_not_connected}};
         _Other ->
-            {error, todo}
+            {error, todo}                       % TODO
     end.
 
-handle_result(_Msg,             ignore)  -> [];
-handle_result({ok, Result},     _Ignore) -> Result;
-handle_result({error, Reason},  _Ignore) -> {error, Reason};
-handle_result({'EXIT', Reason}, _Ignore) -> {error, Reason};
-%% handle_result({'EXIT', _Pid, Reason}, _Ignore) -> {error, Reason};
+handle_result(ok, _) -> [];
+handle_result(_, ignore) -> [];
+handle_result({ok, Result}, _) -> Result;
+handle_result({error, Reason}, _) -> {error, Reason};
+handle_result({'EXIT', Reason}, _) -> {error, Reason};
+handle_result({'EXIT', _, Reason}, _) -> {error, Reason}.
+%%
 %% handle_result({'DOWN', _Ref, _, _Pid, Reason}, _Ignore) -> {error, Reason};
-handle_result(Msg,              _Ignore) -> Msg.
 
 report_error(Reason) ->
     error_logger:error_report(pipeline, [{pid, self()}, {reason, Reason}]).
 
+getval(args, List, Default) ->
+    case lists:filter(fun({Key, _Value})
+                            when Key =:= args; Key =:= args_l; Key =:= args_r
+                                 -> true;
+                         (_)     -> false
+                      end, List)
+    of
+        []     -> Default;
+        [Args] -> Args
+    end;
 getval(Key, List, Default) ->
     case lists:keyfind(Key, 1, List) of
         false ->
@@ -220,26 +278,3 @@ getval(Key, List, Default) ->
         {_Key, Value} ->
             Value
     end.
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% Tests
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
-
-pipeline_test() ->
-    F1 = fun()    -> {ok,    <<"Hello_1 ">>} end,
-    F2 = fun(Msg) -> {error, Msg}            end,
-    F3 = fun()    -> {ok,    [<<"Done">>]}   end,
-    F4 = fun(Msg1, Msg2) -> {ok, list_to_binary(Msg1 ++ Msg2)} end,
-    Spec = [
-            {F1, []},
-            {F2, [ignore]},
-            {F3, [{args, []}]},
-            {F4, [{args, ["Test", " Done!"]}]}
-           ],
-    ?assertMatch({ok, _Pid}, pipeline:start_link({local, pipeline_test}, Spec)),
-    ?assertEqual({ok, <<"Test Done!">>}, pipeline:go(pipeline_test, [])).
-
--endif.
