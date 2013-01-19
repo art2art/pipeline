@@ -1,1 +1,14 @@
 Made in New Year's Eve!
+
+How you can use it:
+
+Pipeline's process is started
+          act0() -> res0 or act0(Init) -> res0
+       => act1(res0) -> res1, res2
+       => act2(res1, res2) -> res3
+       => io:format("~p", res3) -> ...
+       => act3() -> Result
+          {ok, Result} or {error, Reason, {CurrentArg, RemainingFuns}}
+Pipeline's process died
+
+PS: Actually I don't know how it may need you =), but who knows...

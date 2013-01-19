@@ -4,7 +4,7 @@
 -behaviour(gen_server).
 
 -export([start_link/1, start_link/2]).
--export([go/1, go/2, test/0]).
+-export([go/1, go/2]).
 
 -export([init/1,
          handle_call/3,
